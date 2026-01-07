@@ -11,7 +11,7 @@
 typedef ap_fixed<16, 5> fixed_t;
 
 // Define tensor dimensions
-#define N   32     // Sequence length
+#define N   512     // Sequence length
 #define dk  64     // Key/Query dimension
 #define dv  64     // Value dimension
 
