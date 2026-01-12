@@ -3,8 +3,8 @@
 
 // Br: Block size of Query
 // Bc: Block size of Key/Value
-#define Br 64 
-#define Bc 64 
+#define Br 32 
+#define Bc 32 
 
 void compute_attention_HLS(
     fixed_t Q[N][dk], 
@@ -13,9 +13,9 @@ void compute_attention_HLS(
     fixed_t Output[N][dv]
 ) {
     #pragma HLS INTERFACE mode=m_axi port=Q bundle=gmem0 depth=N*dk
-    #pragma HLS INTERFACE mode=m_axi port=K bundle=gmem1 depth=N*dk
-    #pragma HLS INTERFACE mode=m_axi port=V bundle=gmem2 depth=N*dv
-    #pragma HLS INTERFACE mode=m_axi port=Output bundle=gmem3 depth=N*dv
+    #pragma HLS INTERFACE mode=m_axi port=K bundle=gmem0 depth=N*dk
+    #pragma HLS INTERFACE mode=m_axi port=V bundle=gmem0 depth=N*dv
+    #pragma HLS INTERFACE mode=m_axi port=Output bundle=gmem1 depth=N*dv
     
     // Local buffers with partitioning for parallel access
     fixed_t local_Q[Br][dk];
@@ -29,7 +29,7 @@ void compute_attention_HLS(
     
     // Accumulation buffers (higher precision)
     ap_fixed<32,16> local_O[Br][dv];
-    #pragma HLS ARRAY_PARTITION variable=local_O cyclic factor=4 dim=2
+    // #pragma HLS ARRAY_PARTITION variable=local_O cyclic factor=4 dim=2
     
     ap_fixed<32,16> local_m[Br];
     #pragma HLS ARRAY_PARTITION variable=local_m complete
