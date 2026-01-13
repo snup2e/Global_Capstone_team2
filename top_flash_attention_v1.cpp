@@ -3,8 +3,8 @@
 
 // Br: Block size of Query
 // Bc: Block size of Key/Value
-#define Br 32 
-#define Bc 32 
+#define Br 16 
+#define Bc 16 
 
 void compute_attention_HLS(
     fixed_t Q[N][dk], 
