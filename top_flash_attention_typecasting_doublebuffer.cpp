@@ -13,49 +13,54 @@ void compute_attention_HLS(
     //bus[0]
     #pragma HLS INTERFACE mode=m_axi port=Q       bundle=gmem0 depth=N*dk
     #pragma HLS INTERFACE mode=m_axi port=scale_Q bundle=gmem0 depth=N
-    
+
     //bus[1]
     #pragma HLS INTERFACE mode=m_axi port=K       bundle=gmem1 depth=N*dk
     #pragma HLS INTERFACE mode=m_axi port=scale_K bundle=gmem1 depth=N
-    
+
     //bus[2]
     #pragma HLS INTERFACE mode=m_axi port=V       bundle=gmem2 depth=N*dv
     #pragma HLS INTERFACE mode=m_axi port=scale_V bundle=gmem2 depth=N
-    
+
     //bus[3]
     #pragma HLS INTERFACE mode=m_axi port=Output  bundle=gmem3 depth=N*dv
-    
+
     #pragma HLS INTERFACE mode=s_axilite port=return
 
-    // Local buffers
+    // Local buffers for Q (single buffer)
     qint8_t local_Q[Br][dk];
+    #pragma HLS BIND_STORAGE variable=local_Q type=ram_2p impl=bram
     #pragma HLS ARRAY_PARTITION variable=local_Q cyclic factor=4 dim=2
-    
-    qint8_t local_K[Bc][dk];
-    #pragma HLS ARRAY_PARTITION variable=local_K cyclic factor=4 dim=2
-    
-    qint8_t local_V[Bc][dv];
-    #pragma HLS ARRAY_PARTITION variable=local_V cyclic factor=4 dim=2
-    
-    // float local_scale_Q[Br];
-    // float local_scale_K[Bc];
-    // float local_scale_V[Bc];
 
-    scale_fixed_t local_scale_Q[Br]; // float -> scale_fixed_t 
-    scale_fixed_t local_scale_K[Bc];
-    scale_fixed_t local_scale_V[Bc];
-    
+    // Double buffers for K [ping-pong] - BRAM 매핑 + factor=4 유지
+    qint8_t local_K[2][Bc][dk];
+    #pragma HLS BIND_STORAGE variable=local_K type=ram_2p impl=bram
+    #pragma HLS ARRAY_PARTITION variable=local_K cyclic factor=4 dim=3
+
+    // Double buffers for V [ping-pong] - BRAM 매핑 + factor=4 유지
+    qint8_t local_V[2][Bc][dv];
+    #pragma HLS BIND_STORAGE variable=local_V type=ram_2p impl=bram
+    #pragma HLS ARRAY_PARTITION variable=local_V cyclic factor=4 dim=3
+
+    // Scale buffers
+    scale_fixed_t local_scale_Q[Br];
+    scale_fixed_t local_scale_K[2][Bc];
+    scale_fixed_t local_scale_V[2][Bc];
+
+    // Output accumulators - BRAM 매핑
     ap_fixed<32,16> local_O[Br][dv];
+    #pragma HLS BIND_STORAGE variable=local_O type=ram_2p impl=bram
+
     ap_fixed<32,16> local_m[Br];
     #pragma HLS ARRAY_PARTITION variable=local_m complete
     ap_fixed<32,16> local_l[Br];
     #pragma HLS ARRAY_PARTITION variable=local_l complete
 
-    // float attention_scale = 1.0f / hls::sqrt((float)dk);
+    const int num_kv_blocks = N / Bc;
 
     OUTER_Q_LOOP:
     for (int i = 0; i < N; i += Br) {
-        
+
         // Load Q block and scales
         LOAD_Q:
         for (int r = 0; r < Br; r++) {
@@ -70,34 +75,56 @@ void compute_attention_HLS(
         INIT_STATS:
         for (int r = 0; r < Br; r++) {
             #pragma HLS UNROLL
-            local_m[r] = -10000.0; 
+            local_m[r] = -10000.0;
             local_l[r] = 0;
             for (int c = 0; c < dv; c++) {
                 #pragma HLS PIPELINE II=1
-                local_O[r][c] = 0; 
+                local_O[r][c] = 0;
+            }
+        }
+
+        // Prefetch first KV block into buffer 0
+        PREFETCH_FIRST_KV:
+        for (int c = 0; c < Bc; c++) {
+            #pragma HLS PIPELINE II=1
+            local_scale_K[0][c] = (scale_fixed_t)scale_K[c];
+            local_scale_V[0][c] = (scale_fixed_t)scale_V[c];
+            for (int k = 0; k < dk; k++) {
+                local_K[0][c][k] = K[c][k];
+            }
+            for (int v = 0; v < dv; v++) {
+                local_V[0][c][v] = V[c][v];
             }
         }
 
         OUTER_KV_LOOP:
-        for (int j = 0; j < N; j += Bc) {
+        for (int jb = 0; jb < num_kv_blocks; jb++) {
 
-            // Load K, V blocks and scales
-            LOAD_KV:
-            for (int c = 0; c < Bc; c++) {
-                #pragma HLS PIPELINE II=1
-                local_scale_K[c] = (scale_fixed_t)scale_K[j + c];
-                local_scale_V[c] = (scale_fixed_t)scale_V[j + c];
-                for (int k = 0; k < dk; k++) {
-                    local_K[c][k] = K[j + c][k];
-                }
-                for (int v = 0; v < dv; v++) {
-                    local_V[c][v] = V[j + c][v];
+            int curr_buf = jb & 1;        // 0, 1, 0, 1, ...
+            int next_buf = 1 - curr_buf;  // 1, 0, 1, 0, ...
+            int j_next = (jb + 1) * Bc;
+            bool has_next = (jb < num_kv_blocks - 1);
+
+            // Load next KV block (if exists)
+            if (has_next) {
+                LOAD_KV_NEXT:
+                for (int c = 0; c < Bc; c++) {
+                    #pragma HLS PIPELINE II=1
+                    local_scale_K[next_buf][c] = (scale_fixed_t)scale_K[j_next + c];
+                    local_scale_V[next_buf][c] = (scale_fixed_t)scale_V[j_next + c];
+                    for (int k = 0; k < dk; k++) {
+                        local_K[next_buf][c][k] = K[j_next + c][k];
+                    }
+                    for (int v = 0; v < dv; v++) {
+                        local_V[next_buf][c][v] = V[j_next + c][v];
+                    }
                 }
             }
 
+            // Process current block using curr_buf
             PROCESS_ROW:
             for (int r = 0; r < Br; r++) {
-                
+
                 ap_fixed<32,16> scores[Bc];
                 #pragma HLS ARRAY_PARTITION variable=scores complete
                 ap_fixed<32,16> row_max_val = -10000.0;
@@ -106,18 +133,14 @@ void compute_attention_HLS(
                 for (int c = 0; c < Bc; c++) {
                     #pragma HLS PIPELINE II=1
                     qint32_t score_sum_int = 0;
-                    
+
                     SCORE_DOT:
                     for (int k = 0; k < dk; k++) {
                         #pragma HLS UNROLL factor=4
-                        // score_sum_int += (qint32_t)local_Q[r][k] * (qint32_t)local_K[c][k];
-                        score_sum_int += local_Q[r][k] * local_K[c][k];
+                        score_sum_int += local_Q[r][k] * local_K[curr_buf][c][k];
                     }
-                    
-                    // Per-row dequantization
-                    // float dequant_scale = local_scale_Q[r] * local_scale_K[c] * attention_scale;
-                    // scores[c] = (ap_fixed<32,16>)((float)score_sum_int * dequant_scale);
-                    auto combined_scale = local_scale_Q[r] * local_scale_K[c];
+
+                    auto combined_scale = local_scale_Q[r] * local_scale_K[curr_buf][c];
                     auto raw_score = score_sum_int * combined_scale;
                     scores[c] = (ap_fixed<32, 16>)(raw_score >> 3);
 
@@ -137,40 +160,37 @@ void compute_attention_HLS(
                 SOFTMAX_LOOP:
                 for (int c = 0; c < Bc; c++) {
                     #pragma HLS PIPELINE II=1
-                    P[c] = hls::exp((float)(scores[c] - m_new)); 
+                    P[c] = hls::exp((float)(scores[c] - m_new));
                     p_sum_curr += P[c];
                 }
 
-                //new logic
                 ap_fixed<32, 16> scaled_P[Bc];
+                #pragma HLS ARRAY_PARTITION variable=scaled_P complete
+
                 PRE_SCALE_LOOP:
                 for (int c = 0; c < Bc; c++) {
                     #pragma HLS PIPELINE II=1
-                    scaled_P[c] = P[c] * local_scale_V[c];
+                    scaled_P[c] = P[c] * local_scale_V[curr_buf][c];
                 }
-                //
+
                 local_l[r] = local_l[r] * correction_prev + p_sum_curr;
                 local_m[r] = m_new;
-
 
                 OUTPUT_UPDATE:
                 for (int v = 0; v < dv; v++) {
                     #pragma HLS PIPELINE II=1
                     ap_fixed<32,16> weighted_sum = 0;
-                    
+
                     WEIGHTED_SUM:
                     for (int c = 0; c < Bc; c++) {
                         #pragma HLS UNROLL factor=4
-                        // Per-row V dequantization
-                        // ap_fixed<32,16> V_dequant = (ap_fixed<32,16>)((float)local_V[c][v] * local_scale_V[c]);
-                        // weighted_sum += P[c] * V_dequant;
-                        auto term = scaled_P[c] * local_V[c][v];
+                        auto term = scaled_P[c] * local_V[curr_buf][c][v];
                         weighted_sum += term;
                     }
                     local_O[r][v] = local_O[r][v] * correction_prev + weighted_sum;
                 }
-            }
-        }
+            } // end PROCESS_ROW
+        } // end OUTER_KV_LOOP
 
         WRITE_OUTPUT:
         for (int r = 0; r < Br; r++) {
@@ -180,5 +200,5 @@ void compute_attention_HLS(
                 Output[i + r][v] = (fixed_t)(local_O[r][v] * inv_sum);
             }
         }
-    }
+    } // end OUTER_Q_LOOP
 }
